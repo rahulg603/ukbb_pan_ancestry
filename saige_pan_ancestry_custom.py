@@ -11,6 +11,7 @@ from gnomad.utils import slack
 from ukb_common import *
 import time
 import re
+import hailtop.batch as hb
 
 from ukbb_pan_ancestry import *
 from ukb_common.utils.saige_pipeline import *
@@ -25,7 +26,7 @@ pheno_folder = f'{bucket}/phenotype'
 
 DESCRIPTION_PATH = f'{pheno_folder}/field_descriptions.tsv'
 
-HAIL_DOCKER_IMAGE = 'gcr.io/1/hail_utils:6.1'
+HAIL_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/hail_utils:6.1'
 PHENO_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/rgupta_hail_utils'
 SAIGE_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/saige:1.1.5'
 QQ_DOCKER_IMAGE = 'konradjk/saige_qq:0.2'
@@ -52,8 +53,8 @@ def get_custom_phenotype_summary_backup_path(suffix, curdate):
     return f'{pheno_folder}/summary/all_pheno_summary_{suffix}_before_{curdate}.txt.bgz'
 
 
-def get_custom_phenotype_summary_path(suffix, data_type: str, extension = 'ht'):
-    return f'{pheno_folder}/summary/phenotype_{data_type}_{suffix}.{extension}'
+def get_custom_phenotype_summary_path(suffix, extension = 'ht'):
+    return f'{pheno_folder}/summary/phenotype_{suffix}.{extension}'
 
 
 def get_custom_munged_pheno_path(suffix):
@@ -69,7 +70,7 @@ def get_custom_ukb_pheno_mt(suffix, pop: str = 'all'):
     return mt
 
 
-def custom_get_phenos_to_run(suffix, pop, limit, specific_phenos,
+def custom_get_phenos_to_run(suffix, pop, limit, specific_phenos, single_sex_only,
                              skip_case_count_filter, sex_stratified):
     ht = hl.read_table(get_custom_phenotype_summary_path(suffix))
     ht = ht.filter(ht.pop == pop)
@@ -107,13 +108,13 @@ def custom_summarize_data(suffix, overwrite):
     mt = hl.read_matrix_table(get_custom_ukb_pheno_mt_path(suffix))
     ht = mt.group_rows_by('pop').aggregate(
         stats=hl.agg.stats(mt.both_sexes),
-        n_cases_by_pop=hl.cond(hl.set({'continuous', 'biomarkers'}).contains(mt.trait_type),
-                               hl.agg.count_where(hl.is_defined(mt.both_sexes)),
-                               hl.int64(hl.agg.sum(mt.both_sexes)))
+        n_cases_by_pop=hl.if_else(hl.set({'continuous', 'biomarkers'}).contains(mt.trait_type),
+                                  hl.agg.count_where(hl.is_defined(mt.both_sexes)),
+                                  hl.int64(hl.agg.sum(mt.both_sexes)))
     ).entries()
     ht = ht.key_by('pop', *PHENO_KEY_FIELDS)
-    ht = ht.checkpoint(get_custom_phenotype_summary_path(suffix, 'full'), overwrite=overwrite, _read_if_exists=not overwrite)
-    ht.flatten().export(get_custom_phenotype_summary_path(suffix, 'full', 'tsv'))
+    ht = ht.checkpoint(get_custom_phenotype_summary_path(suffix), overwrite=overwrite, _read_if_exists=not overwrite)
+    ht.flatten().export(get_custom_phenotype_summary_path(suffix, 'tsv'))
 
 
 def custom_add_description(mt):
@@ -128,8 +129,10 @@ def custom_load_custom_pheno(data_path, trait_type, modifier, source, sex: str =
     if extension == 'ht':
         ht = hl.read_table(data_path)
     else:
-        ht = hl.import_table(data_path, impute=True)
-        ht = ht.annotate(**{sample_col: hl.tstr(ht[sample_col])})
+        if extension == 'tsv.gz':
+            ht = hl.import_table(data_path, impute=True, force=True)
+        else:
+            ht = hl.import_table(data_path, impute=True)
         ht = ht.key_by(userId=ht[sample_col])
         if sample_col != 'userId':
             ht = ht.drop(sample_col)
@@ -149,13 +152,14 @@ def produce_custom_phenotype_mt(data_path, extn, suffix, trait_type, modifier, s
     mt = custom_load_custom_pheno(data_path, trait_type=trait_type, modifier=modifier, 
                                   source=source, sample_col=sample_col,
                                   extension=extn
-                                  ).checkpoint(get_custom_munged_pheno_path(suffix), args.overwrite)
+                                  ).checkpoint(get_custom_munged_pheno_path(suffix), overwrite=overwrite)
     cov_ht = get_covariates(hl.int32).persist()
     mt = combine_pheno_files_multi_sex_legacy({'custom': mt}, cov_ht)
 
     mt.group_rows_by('pop').aggregate(
         n_cases=hl.agg.count_where(mt.both_sexes == 1.0),
-        n_controls=hl.agg.count_where(mt.both_sexes == 0.0)
+        n_controls=hl.agg.count_where(mt.both_sexes == 0.0),
+        n_defined=hl.agg.count_where(hl.is_defined(mt.both_sexes))
     ).entries().drop(*[x for x in PHENO_COLUMN_FIELDS if x != 'description']).show(100, width=180)
     
     mt_path = get_custom_ukb_pheno_mt_path(suffix)
@@ -175,7 +179,7 @@ def export_pheno_custom(p: Batch, output_path: str, pheno_keys, module: str, mt_
     extract_task: Job = p.new_job(name='extract_pheno', attributes=copy.deepcopy(pheno_keys))
     extract_task.image(docker_image).cpu(n_threads).storage(storage)
     pheno_dict_opts = ' '.join([f"--{k} {shq(v)}" for k, v in pheno_keys.items()])
-    python_command = f"""set -o pipefail; python3 {SCRIPT_DIR}/export_pheno.py
+    python_command = f"""set -o pipefail; python3.8 {SCRIPT_DIR}/export_pheno.py
     --load_module {module} --load_mt_function {mt_loading_function}
     {pheno_dict_opts} {"--binary_trait" if saige_pheno_types.get(pheno_keys['trait_type']) != 'quantitative' else ""}
     --proportion_single_sex {proportion_single_sex}
@@ -189,6 +193,193 @@ def export_pheno_custom(p: Batch, output_path: str, pheno_keys, module: str, mt_
     p.write_output(extract_task.out, output_path)
     p.write_output(extract_task.stdout, f'{output_path}.log')
     return extract_task
+
+
+def custom_fit_null_glmm(p: Batch, output_root: str, pheno_file: Resource, trait_type: str, covariates: str,
+                         plink_file_root: str, docker_image: str, sparse_grm: Resource = None,
+                         sparse_grm_extension: str = None, inv_normalize: bool = False, skip_model_fitting: bool = False,
+                         min_covariate_count: int = 10,
+                         n_threads: int = 16, storage: str = '10Gi', memory: str = '60G',
+                         non_pre_emptible: bool = False, disable_loco: bool = False):
+    analysis_type = "variant" if sparse_grm is None else "gene"
+    pheno_col = 'value'
+    user_id_col = 'userId'
+    in_bfile = p.read_input_group(**{ext: f'{plink_file_root}.{ext}' for ext in ('bed', 'bim', 'fam')})
+    fit_null_task = p.new_job(name=f'fit_null_model',
+                              attributes={
+                                  'analysis_type': analysis_type,
+                                  'trait_type': trait_type
+                              }).storage(storage).image(docker_image)
+    if non_pre_emptible:
+        fit_null_task._cpu = None
+        fit_null_task._memory = None
+        fit_null_task._machine_type = 'n1-highmem-8'
+        fit_null_task._preemptible = False
+    else:
+        fit_null_task = fit_null_task.cpu(n_threads).memory(memory)
+    output_files = {ext: f'{{root}}{ext if ext.startswith("_") else "." + ext}' for ext in
+                   ('rda', f'{analysis_type}.varianceRatio.txt')}
+    if analysis_type == 'gene':
+        sparse_sigma_extension = sparse_grm_extension.replace("GRM", "Sigma")
+        output_files[f'{analysis_type}.varianceRatio.txt{sparse_sigma_extension}'] = \
+            f'{{root}}.{analysis_type}.varianceRatio.txt{sparse_sigma_extension}'
+    fit_null_task.declare_resource_group(null_glmm=output_files)
+    bim_fix_command = f'perl -pi -e s/^chr// {in_bfile.bim}'
+    # if trait_type == 'icd':
+    #     bim_fix_command += (f"; zcat {pheno_file.gz} | perl -p -e 's/true/1/g' | perl -p -e 's/false/0/g' "
+    #                         f"| gzip -c > {pheno_file.gz}.temp.gz; mv {pheno_file.gz}.temp.gz {pheno_file.gz}")
+    loco_str = 'FALSE'
+    command = (f'set -o pipefail; Rscript /usr/local/bin/step1_fitNULLGLMM.R '
+               f'--plinkFile={in_bfile} '
+               f'--phenoFile={pheno_file} '
+               f'--covarColList={covariates} '
+               f'--minCovariateCount={min_covariate_count} '
+               f'--phenoCol={pheno_col} '
+               f'--sampleIDColinphenoFile={user_id_col} '
+               f'--traitType={saige_pheno_types[trait_type]} '
+               f'--outputPrefix={fit_null_task.null_glmm} '
+               f'--outputPrefix_varRatio={fit_null_task.null_glmm}.{analysis_type} '
+               f'--skipModelFitting={str(skip_model_fitting).upper()} ')
+    if inv_normalize:
+        command += '--invNormalize=TRUE '
+    if analysis_type == "gene":
+        fit_null_task.declare_resource_group(sparse_sigma={sparse_sigma_extension: f'{{root}}.{sparse_sigma_extension}'})
+        command += (f'--IsSparseKin=TRUE '
+                    f'--sparseGRMFile={sparse_grm[sparse_grm_extension]} '
+                    f'--sparseGRMSampleIDFile={sparse_grm[f"{sparse_grm_extension}.sampleIDs.txt"]} '
+                    f'--isCateVarianceRatio=TRUE ')
+    else:
+        loco_str = 'FALSE' if disable_loco else 'TRUE'
+    
+    command += f'--nThreads={n_threads} --LOCO={loco_str} 2>&1 | tee {fit_null_task.stdout}'
+    command = '; '.join([bim_fix_command, command])
+    fit_null_task.command(command)
+    p.write_output(fit_null_task.null_glmm, output_root)
+    p.write_output(fit_null_task.stdout, f'{output_root}.{analysis_type}.log')
+    # Runtimes: 8 threads: ~5 minutes of 100% CPU (~3G RAM), followed by ~9 minutes of 800% (~6G RAM)
+    return fit_null_task
+
+
+def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio_file: str,
+                     vcf_file: ResourceGroup, samples_file: ResourceGroup,
+                     docker_image: str,
+                     group_file: str = None, sparse_sigma_file: str = None, use_bgen: bool = True,
+                     trait_type: str = 'continuous',
+                     chrom: str = 'chr1', min_mac: int = 1, min_maf: float = 0, max_maf: float = 0.5,
+                     memory: str = '', storage: str = '10Gi', add_suffix: str = '', log_pvalue: bool = False,
+                     disable_loco: bool = False):
+
+    analysis_type = "gene" if sparse_sigma_file is not None else "variant"
+    run_saige_task: Job = p.new_job(name=f'run_saige',
+                                    attributes={
+                                        'analysis_type': analysis_type
+                                    }).cpu(1).storage(storage).image(docker_image)  # Step 2 is single-threaded only
+
+    if analysis_type == 'gene':
+        run_saige_task.declare_resource_group(result={f'{add_suffix}gene.txt': '{root}',
+                                                      f'{add_suffix}single.txt': '{root}_single'})
+    else:
+        run_saige_task.declare_resource_group(result={'single_variant.txt': '{root}'})
+
+    loco_str = 'FALSE' if disable_loco else 'TRUE'
+    command = (f'set -o pipefail; {MKL_OFF} Rscript /usr/local/bin/step2_SPAtests.R '
+               f'--minMAF={min_maf} '
+               f'--minMAC={min_mac} '
+               f'--sampleFile={samples_file} '
+               f'--GMMATmodelFile={model_file} '
+               #f'{"--IsOutputlogPforSingle=TRUE " if log_pvalue else ""}'
+               f'--varianceRatioFile={variance_ratio_file} '
+               f'--LOCO={loco_str} '
+               f'--chrom={chrom} '
+               f'--SAIGEOutputFile={run_saige_task.result} ')
+
+    if use_bgen:
+        command += (f'--bgenFile={vcf_file.bgen} '
+                    f'--bgenFileIndex={vcf_file["bgen.bgi"]} ')
+    else:
+        command += (f'--vcfFile={vcf_file["vcf.gz"]} '
+                    f'--vcfFileIndex={vcf_file["vcf.gz.tbi"]} '
+                    f'--vcfField=GT ')
+    if analysis_type == "gene":
+        if saige_pheno_types[trait_type] == 'binary':
+            command += f'--IsOutputPvalueNAinGroupTestforBinary=TRUE '
+        command += (f'--groupFile={group_file} '
+                    f'--sparseSigmaFile={sparse_sigma_file} '
+                    f'--is_single_in_groupTest=TRUE '
+                    f'--maxMAF_in_groupTest={max_maf} ')
+                    #f'--IsOutputBETASEinBurdenTest=TRUE ')
+    command += f' 2>&1 | tee {run_saige_task.stdout}; ' # --IsOutputAFinCaseCtrl=TRUE
+    if analysis_type == 'gene':
+        command += f"input_length=$(wc -l {group_file} | awk '{{print $1}}'); " \
+            f"output_length=$(wc -l {run_saige_task.result[f'{add_suffix}gene.txt']} | awk '{{print $1}}'); " \
+            f"echo 'Got input:' $input_length 'output:' $output_length | tee -a {run_saige_task.stdout}; " \
+            f"if [[ $input_length > 0 ]]; then echo 'got input' | tee -a {run_saige_task.stdout}; " \
+            f"if [[ $output_length == 1 ]]; then echo 'but not enough output' | tee -a {run_saige_task.stdout}; " \
+                   f"rm -f {run_saige_task.result[f'{add_suffix}gene.txt']} exit 1; fi; fi"
+    run_saige_task.command(command)
+    p.write_output(run_saige_task.result, output_root)
+    p.write_output(run_saige_task.stdout, f'{output_root}.{analysis_type}.log')
+    return run_saige_task
+
+
+def custom_load_variant_data(directory: str, pheno_key_dict, ukb_vep_path: str, extension: str = 'single.txt',
+                             n_cases: int = -1, n_controls: int = -1, heritability: float = -1.0,
+                             saige_version: str = 'NA', inv_normalized: str = 'NA', log_pvalue: bool = False,
+                             overwrite: bool = False, legacy_annotations: bool = False,
+                             num_partitions: int = 1000):
+    output_ht_path = f'{directory}/variant_results.ht'
+    ht = hl.import_table(f'{directory}/*.{extension}', delimiter='\t', impute=True)
+    print(f'Loading: {directory}/*.{extension} ...')
+    marker_id_col = 'markerID' if extension == 'single.txt' else 'MarkerID'
+    locus_alleles = ht[marker_id_col].split('_')
+    if n_cases == -1: n_cases = hl.null(hl.tint)
+    if n_controls == -1: n_controls = hl.null(hl.tint)
+    if heritability == -1.0: heritability = hl.null(hl.tfloat)
+    if saige_version == 'NA': saige_version = hl.null(hl.tstr)
+    if inv_normalized == 'NA': inv_normalized = hl.null(hl.tstr)
+
+    ht = ht.key_by(locus=hl.parse_locus(locus_alleles[0]), alleles=locus_alleles[1].split('/'),
+                   **pheno_key_dict).distinct().naive_coalesce(num_partitions)
+    if marker_id_col == 'MarkerID':
+        ht = ht.drop('CHR', 'POS', 'MarkerID', 'Allele1', 'Allele2')
+    ht = ht.transmute(Pvalue=ht['p.value']).annotate_globals(
+        n_cases=n_cases, n_controls=n_controls, heritability=heritability, saige_version=saige_version,
+        inv_normalized=inv_normalized, log_pvalue=log_pvalue)
+    ht = ht.drop('Tstat')
+    ht = ht.annotate(**get_vep_formatted_data(ukb_vep_path, legacy_annotations=legacy_annotations)[
+        hl.struct(locus=ht.locus, alleles=ht.alleles)])  # TODO: fix this for variants that overlap multiple genes
+    ht = ht.checkpoint(output_ht_path, overwrite=overwrite, _read_if_exists=not overwrite).drop('n_cases', 'n_controls', 'heritability')
+
+
+def custom_get_cases_and_controls_from_log(log_format):
+    """
+    'gs://path/to/result_chr{chrom}_000000001.variant.log'
+    """
+    cases = controls = -1
+    for chrom in range(10, 23):
+        try:
+            with hl.hadoop_open(log_format.format(chrom=chrom)) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('Analyzing'):
+                        fields = line.split()
+                        if len(fields) == 6:
+                            try:
+                                cases = int(fields[1])
+                                controls = int(fields[4])
+                                break
+                            except ValueError:
+                                logger.warn(f'Could not load number of cases or controls from {line}.')
+                    elif line.startswith('samples (Nbgen):'):
+                        fields = line.split(':')
+                        try:
+                            cases = int(fields[1])
+                        except ValueError:
+                            logger.warn(f'Could not load number of cases or controls from {line}.')
+            return cases, controls
+        except:
+            pass
+    return cases, controls
 
 
 def main(args):
@@ -229,8 +420,8 @@ def main(args):
         window = '1e7' if pop == 'EUR' else '1e6'
         logger.info(f'Setting up {pop}...')
         chunk_size = int(5e6) if pop != 'EUR' else int(1e6)
-        phenos_to_run = custom_get_phenos_to_run(pop, suffix=args.suffix, limit=int(args.local_test),
-                                                 specific_phenos=args.phenos,
+        phenos_to_run = custom_get_phenos_to_run(pop=pop, suffix=args.suffix, limit=int(args.local_test),
+                                                 specific_phenos=args.phenos, single_sex_only=args.single_sex_only,
                                                  skip_case_count_filter=args.skip_case_count_filter,
                                                  sex_stratified=args.sex_stratified)
         logger.info(f'Got {len(phenos_to_run)} phenotypes...')
@@ -249,12 +440,12 @@ def main(args):
                 pheno_file = p.read_input(pheno_export_path)
             else:
                 # NOTE need to update module and function name
-                pheno_task = export_pheno_custom(p, pheno_export_path, pheno_key_dict, 'ukbb_pan_ancestry', 'get_custom_ukb_pheno_mt', 
-                                                 PHENO_DOCKER_IMAGE, additional_args=pop, n_threads=n_threads, proportion_single_sex=0)
+                pheno_task = export_pheno_custom(p, pheno_export_path, pheno_key_dict, 'ukbb_pan_ancestry.saige_pan_ancestry_custom', 'get_custom_ukb_pheno_mt', 
+                                                 PHENO_DOCKER_IMAGE, additional_args=f'{args.suffix},{pop}', n_threads=n_threads, proportion_single_sex=0)
                 pheno_task.attributes.update({'pop': pop})
                 pheno_file = pheno_task.out
             pheno_exports[stringify_pheno_key_dict(pheno_key_dict)] = pheno_file
-        completed = Counter([isinstance(x, InputResourceFile) for x in pheno_exports.values()])
+        completed = Counter([isinstance(x, hb.resource.InputResourceFile) for x in pheno_exports.values()])
         logger.info(f'Exporting {completed[False]} phenos (already found {completed[True]})...')
 
         overwrite_null_models = args.create_null_models
@@ -275,18 +466,18 @@ def main(args):
                 variance_ratio_file = p.read_input(variance_ratio_file_path)
             else:
                 if args.skip_any_null_models: continue
-                fit_null_task = fit_null_glmm(p, null_glmm_root, pheno_exports[stringify_pheno_key_dict(pheno_key_dict)],
-                                              pheno_key_dict['trait_type'], covariates,
-                                              get_ukb_grm_plink_path(pop, iteration, window), SAIGE_DOCKER_IMAGE,
-                                              inv_normalize=False, n_threads=n_threads, min_covariate_count=1,
-                                              non_pre_emptible=args.non_pre_emptible, storage='100Gi')
+                fit_null_task = custom_fit_null_glmm(p, null_glmm_root, pheno_exports[stringify_pheno_key_dict(pheno_key_dict)],
+                                                     pheno_key_dict['trait_type'], covariates,
+                                                     get_ukb_grm_plink_path(pop, iteration, window), SAIGE_DOCKER_IMAGE,
+                                                     inv_normalize=False, n_threads=n_threads, min_covariate_count=1,
+                                                     non_pre_emptible=args.non_pre_emptible, storage='100Gi', disable_loco=args.disable_loco)
                 fit_null_task.attributes.update({'pop': pop})
                 fit_null_task.attributes.update(copy.deepcopy(pheno_key_dict))
                 model_file = fit_null_task.null_glmm.rda
                 variance_ratio_file = fit_null_task.null_glmm[f'{analysis_type}.varianceRatio.txt']
             null_models[stringify_pheno_key_dict(pheno_key_dict)] = (model_file, variance_ratio_file)
 
-        completed = Counter([isinstance(x[0], InputResourceFile) for x in null_models.values()])
+        completed = Counter([isinstance(x[0], hb.resource.InputResourceFile) for x in null_models.values()])
         logger.info(f'Running {completed[False]} null models (already found {completed[True]})...')
 
         use_bgen = True
@@ -296,7 +487,7 @@ def main(args):
         vcfs_already_created = {}
         if not overwrite_vcfs and hl.hadoop_exists(vcf_dir):
             vcfs_already_created = {x['path'] for x in hl.hadoop_ls(vcf_dir)}
-        # logger.info(f'Found {len(vcfs_already_created)} VCFs in directory...')
+            logger.info(f'Found {len(vcfs_already_created)} VCFs in directory...')
         vcfs = {}
         for chromosome in chromosomes:
             chrom_length = chrom_lengths[chromosome]
@@ -325,7 +516,7 @@ def main(args):
             if args.local_test:
                 break
 
-        completed = Counter([type(x) == InputResourceFile for x in vcfs.values()])
+        completed = Counter([type(x) == hb.resource.InputResourceFile for x in vcfs.values()])
         logger.info(f'Creating {completed[False]} VCFs (already found {completed[True]})...')
 
         result_dir = f'{root}/result/{args.suffix}/{pop}'
@@ -356,9 +547,9 @@ def main(args):
                     results_path = get_results_prefix(pheno_results_dir, pheno_key_dict, chromosome, start_pos, legacy=False)
                     if overwrite_results or f'{results_path}.single_variant.txt' not in results_already_created:
                         samples_file = p.read_input(get_ukb_samples_file_path(pop, iteration))
-                        saige_task = run_saige(p, results_path, model_file, variance_ratio_file, vcf_file, samples_file,
-                                               SAIGE_DOCKER_IMAGE, trait_type=pheno_key_dict['trait_type'], use_bgen=use_bgen,
-                                               chrom=chromosome, log_pvalue=log_pvalue)
+                        saige_task = custom_run_saige(p, results_path, model_file, variance_ratio_file, vcf_file, samples_file,
+                                                      SAIGE_DOCKER_IMAGE, trait_type=pheno_key_dict['trait_type'], use_bgen=use_bgen,
+                                                      chrom=chromosome, log_pvalue=log_pvalue, disable_loco=args.disable_loco)
                         saige_task.attributes.update({'interval': interval, 'pop': pop})
                         saige_task.attributes.update(copy.deepcopy(pheno_key_dict))
                         saige_tasks.append(saige_task)
@@ -383,8 +574,7 @@ def main(args):
                                                    saige_tasks, get_ukb_vep_path(), HAIL_DOCKER_IMAGE,
                                                    saige_log=saige_log, analysis_type=analysis_type,
                                                    n_threads=n_threads, null_glmm_log=null_glmm_root,
-                                                   reference=reference, legacy_annotations=True,
-                                                   log_pvalue=log_pvalue)
+                                                   reference=reference, legacy_annotations=True)#, log_pvalue=log_pvalue)
                 load_task.attributes['pop'] = pop
                 res_tasks.append(load_task)
                 qq_export, qq_plot = qq_plot_results(p, pheno_results_dir, res_tasks, HAIL_DOCKER_IMAGE, QQ_DOCKER_IMAGE, n_threads=n_threads)
@@ -428,6 +618,7 @@ if __name__ == '__main__':
     parser.add_argument('--modifier', required=True, type=str, help='Global modifier for this dataset used for phenotype munging.')
     parser.add_argument('--source', required=True, type=str, help='Data source for tagging, used for pheontype munging.')
     parser.add_argument('--append', action='store_true', help='If enabled, will attempt to augment the pheno MT with new phenotypes.')
+    parser.add_argument('--disable_loco', action='store_true', help='If enabled, will avoid LOCO. This was the original pan-ancestry pipeline behavior.')
     args = parser.parse_args()
 
     main(args)
