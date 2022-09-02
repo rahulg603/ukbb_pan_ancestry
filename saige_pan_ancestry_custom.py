@@ -426,10 +426,10 @@ def custom_get_cases_and_controls_from_log(log_format):
                                 break
                             except ValueError:
                                 logger.warn(f'Could not load number of cases or controls from {line}.')
-                    elif line.startswith('samples (Nbgen):'):
-                        fields = line.split(':')
+                    elif line.endswith('samples will be used for analysis'):
+                        fields = line.split()
                         try:
-                            cases = int(fields[1])
+                            cases = int(fields[0])
                         except ValueError:
                             logger.warn(f'Could not load number of cases or controls from {line}.')
             return cases, controls
