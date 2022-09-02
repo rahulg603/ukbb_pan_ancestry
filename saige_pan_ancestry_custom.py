@@ -287,7 +287,7 @@ def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio
                f'--minMAC={min_mac} '
                f'--sampleFile={samples_file} '
                f'--GMMATmodelFile={model_file} '
-               #f'{"--IsOutputlogPforSingle=TRUE " if log_pvalue else ""}'
+               f'{"--IsOutputlogPforSingle=TRUE " if log_pvalue else ""}'
                f'--varianceRatioFile={variance_ratio_file} '
                f'--LOCO={loco_str} '
                f'--chrom={chrom} '
@@ -320,6 +320,62 @@ def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio
     p.write_output(run_saige_task.result, output_root)
     p.write_output(run_saige_task.stdout, f'{output_root}.{analysis_type}.log')
     return run_saige_task
+
+
+def custom_load_results_into_hail(p: Batch, output_root: str, pheno_keys, tasks_to_hold,
+                                  vep_path: str, docker_image: str, gene_map_path: str = None, null_glmm_log: str = '',
+                                  reference: str = 'GRCh38', saige_log: str = '', analysis_type: str = 'gene',
+                                  n_threads: int = 8, storage: str = '10Gi', legacy_annotations: bool = False,
+                                  log_pvalue: bool = False, overwrite: bool = True):
+    load_data_task: Job = p.new_job(name=f'load_data', attributes=copy.deepcopy(pheno_keys)
+                                    ).image(docker_image).cpu(n_threads).storage(storage).memory('standard')
+    load_data_task.always_run().depends_on(*tasks_to_hold)
+    pheno_dict_opts = ' '.join([f"--{k} {shq(v)}" for k, v in pheno_keys.items()])
+    python_command = f"""python3.8 {SCRIPT_DIR}/load_results.py
+    --input_dir {shq(output_root)}
+    {"--null_glmm_log " + shq(null_glmm_log) if null_glmm_log else ''}
+    --saige_run_log_format {saige_log}
+    {pheno_dict_opts}
+    {"--gene_map_ht_raw_path " + gene_map_path if gene_map_path else ''}
+    {"--legacy_annotations" if legacy_annotations else ""}
+    --ukb_vep_ht_path {vep_path}
+    {"--overwrite" if overwrite else ""} --reference {reference}
+    --analysis_type {analysis_type} {"--log_pvalue" if log_pvalue else ""}
+    --n_threads {n_threads} | tee {load_data_task.stdout}
+    ;""".replace('\n', ' ')
+
+    python_command = python_command.replace('\n', '; ').strip()
+    command = f'set -o pipefail; PYTHONPATH=$PYTHONPATH:/ PYSPARK_SUBMIT_ARGS="--conf spark.driver.memory={int(3 * n_threads)}g pyspark-shell" ' + python_command
+    load_data_task.command(command)
+    activate_service_account(load_data_task)
+    p.write_output(load_data_task.stdout, f'{output_root}/{pheno_keys["phenocode"]}_loading.log')
+    return load_data_task
+
+
+def custom_qq_plot_results(p: Batch, output_root: str, tasks_to_hold, export_docker_image: str, R_docker_image: str,
+                    n_threads: int = 8, storage: str = '10Gi'):
+
+    qq_export_task: Job = p.new_job(name='qq_export').image(export_docker_image).cpu(n_threads).storage(storage)
+    qq_export_task.always_run().depends_on(*tasks_to_hold)
+
+    python_command = f"""python3.8 {SCRIPT_DIR}/export_results_for_qq.py
+    --input_dir {shq(output_root)}
+    --output_file {qq_export_task.out}
+    --n_threads {n_threads}
+    ; """.replace('\n', ' ')
+
+    command = f'set -o pipefail; PYTHONPATH=$PYTHONPATH:/ PYSPARK_SUBMIT_ARGS="--conf spark.driver.memory={int(3 * n_threads)}g pyspark-shell" ' + python_command
+    qq_export_task.command(command)
+    activate_service_account(qq_export_task)
+
+    qq_task: Job = p.new_job(name='qq_plot').image(R_docker_image).cpu(n_threads).storage(storage).always_run()
+    qq_task.declare_resource_group(result={ext: f'{{root}}_Pvalue_{ext}'
+                                           for ext in ('qqplot.png', 'manhattan.png', 'manhattan_loglog.png', 'qquantiles.txt')})
+    R_command = f"/saige-pipelines/scripts/qqplot.R -f {qq_export_task.out} -o {qq_task.result} -p Pvalue; "
+    qq_task.command(R_command)
+
+    p.write_output(qq_task.result, output_root)
+    return qq_export_task, qq_task
 
 
 def custom_load_variant_data(directory: str, pheno_key_dict, ukb_vep_path: str, extension: str = 'single.txt',
@@ -521,7 +577,6 @@ def main(args):
 
         result_dir = f'{root}/result/{args.suffix}/{pop}'
         overwrite_results = args.overwrite_results
-        log_pvalue = True
         for i, pheno_key_dict in enumerate(phenos_to_run):
             if stringify_pheno_key_dict(pheno_key_dict) not in null_models: continue
             model_file, variance_ratio_file = null_models[stringify_pheno_key_dict(pheno_key_dict)]
@@ -549,7 +604,7 @@ def main(args):
                         samples_file = p.read_input(get_ukb_samples_file_path(pop, iteration))
                         saige_task = custom_run_saige(p, results_path, model_file, variance_ratio_file, vcf_file, samples_file,
                                                       SAIGE_DOCKER_IMAGE, trait_type=pheno_key_dict['trait_type'], use_bgen=use_bgen,
-                                                      chrom=chromosome, log_pvalue=log_pvalue, disable_loco=args.disable_loco)
+                                                      chrom=chromosome, log_pvalue=args.log_p, disable_loco=args.disable_loco)
                         saige_task.attributes.update({'interval': interval, 'pop': pop})
                         saige_task.attributes.update(copy.deepcopy(pheno_key_dict))
                         saige_tasks.append(saige_task)
@@ -570,14 +625,14 @@ def main(args):
                                             legacy=False)
                 saige_log = f'{prefix}.{analysis_type}.log'
 
-                load_task = load_results_into_hail(p, pheno_results_dir, pheno_key_dict,
-                                                   saige_tasks, get_ukb_vep_path(), HAIL_DOCKER_IMAGE,
-                                                   saige_log=saige_log, analysis_type=analysis_type,
-                                                   n_threads=n_threads, null_glmm_log=null_glmm_root,
-                                                   reference=reference, legacy_annotations=True)#, log_pvalue=log_pvalue)
+                load_task = custom_load_results_into_hail(p, pheno_results_dir, pheno_key_dict,
+                                                          saige_tasks, get_ukb_vep_path(), PHENO_DOCKER_IMAGE,
+                                                          saige_log=saige_log, analysis_type=analysis_type,
+                                                          n_threads=args.n_cpu_merge, null_glmm_log=null_glmm_root,
+                                                          reference=reference, legacy_annotations=True, log_pvalue=args.log_p)
                 load_task.attributes['pop'] = pop
                 res_tasks.append(load_task)
-                qq_export, qq_plot = qq_plot_results(p, pheno_results_dir, res_tasks, HAIL_DOCKER_IMAGE, QQ_DOCKER_IMAGE, n_threads=n_threads)
+                qq_export, qq_plot = custom_qq_plot_results(p, pheno_results_dir, res_tasks, PHENO_DOCKER_IMAGE, QQ_DOCKER_IMAGE, n_threads=n_threads)
                 qq_export.attributes.update({'pop': pop})
                 qq_export.attributes.update(copy.deepcopy(pheno_key_dict))
                 qq_plot.attributes.update({'pop': pop})
@@ -619,6 +674,8 @@ if __name__ == '__main__':
     parser.add_argument('--source', required=True, type=str, help='Data source for tagging, used for pheontype munging.')
     parser.add_argument('--append', action='store_true', help='If enabled, will attempt to augment the pheno MT with new phenotypes.')
     parser.add_argument('--disable_loco', action='store_true', help='If enabled, will avoid LOCO. This was the original pan-ancestry pipeline behavior.')
+    parser.add_argument('--log_p', action='store_true', help='Log transform p-values via SAIGE.')
+    parser.add_argument('--n_cpu_merge', type=int, default=8, help='Number of threads to request during summary stat merging.')
     args = parser.parse_args()
 
     main(args)
