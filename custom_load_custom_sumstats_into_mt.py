@@ -111,7 +111,7 @@ def generate_sumstats_mt(all_variant_outputs, pheno_dict, temp_dir, inner_mode =
                               inner_mode=inner_mode, repartition_final=20000)
 
     if checkpoint:
-        mt = mt.checkpoint(f'{temp_dir}/staging.mt', **{inner_mode: True}, overwrite=True)
+        mt = mt.checkpoint(f'{temp_dir}/staging.mt', **{inner_mode: True})
     mt = custom_patch_mt_keys(mt)
     key = mt.col_key.annotate(phenocode=format_pheno_dir(mt.phenocode))
     mt = check_and_annotate_with_dict(mt, pheno_dict, key)
