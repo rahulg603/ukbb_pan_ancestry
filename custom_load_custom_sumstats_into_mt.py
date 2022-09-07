@@ -9,6 +9,7 @@ from datetime import date
 from collections import Counter
 from tqdm import tqdm
 from ukbb_pan_ancestry import *
+from ukbb_pan_ancestry.load_all_results import apply_qc
 from ukbb_pan_ancestry.saige_pan_ancestry_custom import *
 
 
@@ -49,7 +50,7 @@ def custom_unify_saige_ht_schema(ht, patch_case_control_count: str = ''):
                        'p.value.NA', 'Is.SPA.converge', 'var', 'AF.Cases',
                        'AF.Controls', 'Pvalue', gene=hl.or_else(ht.gene, ''), annotation=hl.or_else(ht.annotation, ''))
     
-    ht = ht.annotate(BETA = hl.tfloat64(ht.BETA), SE = hl.tfloat64(ht.SE))
+    ht = ht.annotate(BETA = hl.float64(ht.BETA), SE = hl.float64(ht.SE))
 
     # ht2 = ht.head(1)
     # pheno_key_dict = dict(ht2.aggregate(hl.agg.take(ht2.key, 1)[0]))
@@ -111,7 +112,7 @@ def generate_sumstats_mt(all_variant_outputs, pheno_dict, temp_dir, inner_mode =
 
     if checkpoint:
         mt = mt.checkpoint(f'{temp_dir}/staging.mt', **{inner_mode: True}, overwrite=True)
-    mt = patch_mt_keys(mt)
+    mt = custom_patch_mt_keys(mt)
     key = mt.col_key.annotate(phenocode=format_pheno_dir(mt.phenocode))
     mt = check_and_annotate_with_dict(mt, pheno_dict, key)
     if mt.inv_normalized.dtype == hl.tstr:
@@ -122,7 +123,7 @@ def generate_sumstats_mt(all_variant_outputs, pheno_dict, temp_dir, inner_mode =
     return mt
 
 
-def write_full_mt(suffix, overwrite):
+def write_full_mt(suffix, temp_dir, overwrite):
     mts = []
     for pop in POPS:
         mt = hl.read_matrix_table(custom_get_variant_results_path(pop, suffix, 'mt')).annotate_cols(pop=pop)
@@ -140,6 +141,8 @@ def write_full_mt(suffix, overwrite):
     full_mt = mts[0]
     for mt in mts[1:]:
         full_mt = full_mt.union_cols(mt, row_join_type='outer')
+    
+    full_mt = full_mt.checkpoint(f'{temp_dir}/staging_full.mt', overwrite=True)
     full_mt = full_mt.collect_cols_by_key()
     full_mt = full_mt.annotate_cols(
         pheno_data=full_mt.pheno_data.map(lambda x: x.drop(*PHENO_COLUMN_FIELDS)),
@@ -150,7 +153,6 @@ def write_full_mt(suffix, overwrite):
     full_mt.write(custom_get_variant_results_path('full', suffix), overwrite)
     print('Pops per pheno:')
     pprint(dict(Counter(full_mt.aggregate_cols(hl.agg.counter(hl.len(full_mt.pheno_data))))))
-
 
 
 def reannotate_cols(mt, suffix):
@@ -195,8 +197,9 @@ def main(args):
     if args.run_additional_load:
         today = date.today().strftime("%y%m%d")
         for pop in pops:
-            all_variant_outputs = get_all_valid_variant_results_ht_paths(pop, args.suffix)
-            pheno_dict = get_pheno_dict(args.suffix)
+            # data will be drawn from --suffix2 and merged into --suffix
+            all_variant_outputs = get_all_valid_variant_results_ht_paths(pop, args.suffix2)
+            pheno_dict = get_pheno_dict(args.suffix2)
 
             all_keys = hl.read_matrix_table(custom_get_variant_results_path(pop, args.suffix, 'mt')).col_key.collect()
             loaded_phenos = {
@@ -237,17 +240,17 @@ def main(args):
                 original_mt = original_mt.filter_cols(
                     hl.literal(pheno_matches).contains(hl.delimit(list(original_mt.col_key.values()), '-')), keep=False)
                 print(f'\n\nGoing from {original} to {original_mt.count_cols()}...\n\n')
-            mt = re_colkey_mt(mt)
-            original_mt = re_colkey_mt(original_mt)
+            mt = re_colkey_mt(mt.annotate_cols(pop=pop))
+            original_mt = re_colkey_mt(original_mt.annotate_cols(pop=pop))
             mt = original_mt.union_cols(mt, row_join_type='outer')
             mt.write(custom_get_variant_results_path(pop, args.suffix, 'mt'), overwrite=args.overwrite)
 
     if args.run_combine_load:
-        write_full_mt(args.suffix, args.overwrite)
+        write_full_mt(args.suffix, f'{temp_bucket}/{args.suffix}/full', args.overwrite)
 
 
 def re_colkey_mt(mt):
-    mt = mt.key_cols_by().select_cols(*PHENO_KEY_FIELDS, *PHENO_COLUMN_FIELDS, *PHENO_GWAS_FIELDS, 'pop')
+    mt = mt.key_cols_by().select_cols(*PHENO_KEY_FIELDS, *PHENO_COLUMN_FIELDS, *PHENO_GWAS_FIELDS, 'log_pvalue', 'pop')
     return mt.key_cols_by(*PHENO_KEY_FIELDS)
 
 
@@ -256,6 +259,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--overwrite', help='Overwrite everything', action='store_true')
     parser.add_argument('--suffix', help='Loads everything for a particular suffix.', required=True)
+    parser.add_argument('--suffix2', help='Use with additional load. Will append items from this to MTs for suffix.')
     parser.add_argument('--run_basic_load', help='Overwrite everything', action='store_true')
     parser.add_argument('--run_additional_load', help='Overwrite everything', action='store_true')
     parser.add_argument('--run_combine_load', help='Overwrite everything', action='store_true')
