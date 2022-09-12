@@ -61,13 +61,23 @@ def get_custom_munged_pheno_path(suffix):
     return f'{pheno_folder}/mt/munged/munged_raw_phenotype_{suffix}.mt'
 
 
-def get_custom_ukb_pheno_mt(suffix, pop: str = 'all'):
+def get_custom_ukb_pheno_mt(suffix, pop: str = 'all', custom_covars: str = None):
     mt = hl.read_matrix_table(get_custom_ukb_pheno_mt_path(suffix))
     # mt = mt.annotate_rows(**get_ukb_meta(key_type=hl.tint32)[mt.row_key])
-    mt = mt.annotate_rows(**get_covariates(key_type=hl.int32)[mt.row_key])
+    mt = mt.annotate_rows(**get_covariates_with_custom(key_type=hl.int32, custom=custom_covars)[mt.row_key])
     if pop != 'all':
         mt = mt.filter_rows(mt.pop == pop)
     return mt
+
+
+def get_covariates_with_custom(key_type, custom):
+    new_covariates = get_covariates(key_type=key_type)
+    if custom is None:
+        return new_covariates
+    else:
+        custom_covariates = hl.import_table(custom, impute=True)
+        custom_covariates = custom_covariates.annotate(s = key_type(custom_covariates.s)).key_by('s')
+        return new_covariates.annotate(**custom_covariates[new_covariates.key])
 
 
 def custom_get_phenos_to_run(suffix, pop, limit, specific_phenos, single_sex_only,
@@ -147,13 +157,13 @@ def custom_load_custom_pheno(data_path, trait_type, modifier, source, sex: str =
     return mt
 
 
-def produce_custom_phenotype_mt(data_path, extn, suffix, trait_type, modifier, source, sample_col='s', append=True, overwrite=False):
+def produce_custom_phenotype_mt(data_path, extn, suffix, trait_type, modifier, source, sample_col='s', append=True, overwrite=False, custom_covars=None):
     curdate = date.today().strftime("%y%m%d")
     mt = custom_load_custom_pheno(data_path, trait_type=trait_type, modifier=modifier, 
                                   source=source, sample_col=sample_col,
                                   extension=extn
                                   ).checkpoint(get_custom_munged_pheno_path(suffix), overwrite=overwrite)
-    cov_ht = get_covariates(hl.int32).persist()
+    cov_ht = get_covariates_with_custom(hl.int32, custom_covars).persist()
     mt = combine_pheno_files_multi_sex_legacy({'custom': mt}, cov_ht)
 
     mt.group_rows_by('pop').aggregate(
@@ -466,7 +476,8 @@ def main(args):
         produce_custom_phenotype_mt(args.data_path, args.data_extn, args.suffix, 
                                     trait_type=args.trait_type, modifier=args.modifier,
                                     source=args.source, sample_col=args.sample_col, 
-                                    append=args.append, overwrite=args.overwrite_pheno_data)
+                                    append=args.append, overwrite=args.overwrite_pheno_data,
+                                    custom_covars=args.include_addl_covariates)
 
     backend = hb.ServiceBackend(billing_project='ukb_diverse_pops',
                                 bucket=temp_bucket.split('gs://', 1)[-1])
@@ -496,8 +507,9 @@ def main(args):
                 pheno_file = p.read_input(pheno_export_path)
             else:
                 # NOTE need to update module and function name
+                addlargs = f'{args.suffix},{pop}' if args.include_addl_covariates is None else f'{args.suffix},{pop},{args.include_addl_covariates}'
                 pheno_task = export_pheno_custom(p, pheno_export_path, pheno_key_dict, 'ukbb_pan_ancestry.saige_pan_ancestry_custom', 'get_custom_ukb_pheno_mt', 
-                                                 PHENO_DOCKER_IMAGE, additional_args=f'{args.suffix},{pop}', n_threads=n_threads, proportion_single_sex=0)
+                                                 PHENO_DOCKER_IMAGE, additional_args=addlargs, n_threads=n_threads, proportion_single_sex=0)
                 pheno_task.attributes.update({'pop': pop})
                 pheno_file = pheno_task.out
             pheno_exports[stringify_pheno_key_dict(pheno_key_dict)] = pheno_file
@@ -665,6 +677,7 @@ if __name__ == '__main__':
     parser.add_argument('--pops', help='comma-searated list')
     parser.add_argument('--dry_run', help='Dry run only', action='store_true')
     parser.add_argument('--include_base_covariates', help='If true, will include the usual age, sex covariates.', action='store_true')
+    parser.add_argument('--include_addl_covariates', help='Points to a .tsv with additional covariates. All will be included. Must have sample key as s.', type=str)
     parser.add_argument('--data_path', required=True, type=str, help='Path to phenotype data.')
     parser.add_argument('--sample_col', default='s', type=str, help='Sample identifier column.')
     parser.add_argument('--data_extn', required=True, type=str, help='Type of the phenotype data (ht or tsv).')
