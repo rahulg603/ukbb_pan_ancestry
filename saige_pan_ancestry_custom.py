@@ -77,7 +77,7 @@ def get_covariates_with_custom(key_type, custom):
     if custom is None:
         return new_covariates
     else:
-        custom_covariates = hl.import_table(custom, impute=True, min_partitions=160
+        custom_covariates = hl.import_table(custom, impute=True, min_partitions=40
                              ).checkpoint(f'{temp_bucket}/temp_covars.ht', overwrite=True)
         custom_covariates = custom_covariates.annotate(s = key_type(custom_covariates.s)).key_by('s')
         return new_covariates.annotate(**custom_covariates[new_covariates.key]).checkpoint(f'{temp_bucket}/temp_covars_2.ht', overwrite=True)
@@ -476,7 +476,7 @@ def main(args):
     else:
         addl_covars = []
     covariates = ','.join(basic_covars + addl_covars + [f'PC{x}' for x in range(1, num_pcs + 1)])
-    n_threads = 8
+    n_threads = args.n_threads
     analysis_type = "variant"
     chromosomes = list(map(str, range(1, 23))) + ['X']
     reference = 'GRCh37'
@@ -708,6 +708,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_p', action='store_true', help='Log transform p-values via SAIGE.')
     parser.add_argument('--n_cpu_saige', type=int, default=1, help='Number of threads to request for running SAIGE.')
     parser.add_argument('--n_cpu_merge', type=int, default=8, help='Number of threads to request during summary stat merging.')
+    parser.add_argument('--n_threads', default=8, type=int)
     parser.add_argument('--force_inv_normalize', action='store_true')
     args = parser.parse_args()
 
