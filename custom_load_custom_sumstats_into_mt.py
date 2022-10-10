@@ -15,8 +15,11 @@ from ukbb_pan_ancestry.saige_pan_ancestry_custom import *
 
 def get_all_valid_variant_results_ht_paths(pop, suffix):
     results_dir = f'{root}/result/{suffix}/{pop}'
-    all_phenos_dir = hl.hadoop_ls(results_dir)
-    all_variant_outputs = get_files_in_parent_directory(all_phenos_dir)
+    if not hl.hadoop_exists(results_dir):
+        all_variant_outputs = []
+    else:
+        all_phenos_dir = hl.hadoop_ls(results_dir)
+        all_variant_outputs = get_files_in_parent_directory(all_phenos_dir)
     return all_variant_outputs
 
 
@@ -38,7 +41,7 @@ def custom_unify_saige_ht_schema(ht, patch_case_control_count: str = ''):
     :return:
     :rtype: Table
     """
-    assert ht.head(1).annotation.collect()[0] is None, f'failed at {patch_case_control_count}'
+    #assert ht.head(1).annotation.collect()[0] is None, f'failed at {patch_case_control_count}'
     if 'AF.Cases' not in list(ht.row):
         ht = ht.select('AC_Allele2', 'AF_Allele2', 'MissingRate', 'N', 'BETA', 'SE',
                        **{'p.value.NA': hl.null(hl.tfloat64), 'Is.SPA.converge': hl.null(hl.tint32),
@@ -101,6 +104,17 @@ def check_and_annotate_with_dict(mt, input_dict, dict_key_from_mt, axis='cols'):
     return mt
 
 
+def merge_globals(all_hts, globals_to_add, col_keys):
+    rekeyed_hts = []
+    for ht in all_hts:
+        ht2 = ht.head(1).key_by(*col_keys).select()
+        ht2 = ht2.annotate(**{f'{x}_custom': ht2[x] for x in globals_to_add})
+        ht2 = ht2.drop(*globals_to_add)
+        ht2 = ht2.rename({f'{x}_custom':x for x in globals_to_add}).select_globals()
+        rekeyed_hts.append(ht2)
+    return hl.Table.union(*rekeyed_hts)
+
+
 def generate_sumstats_mt(all_variant_outputs, pheno_dict, temp_dir, inner_mode = '_read_if_exists',
                          checkpoint: bool = False):
     row_keys = ['locus', 'alleles', 'gene', 'annotation']
@@ -123,12 +137,18 @@ def generate_sumstats_mt(all_variant_outputs, pheno_dict, temp_dir, inner_mode =
     return mt
 
 
-def write_full_mt(suffix, temp_dir, overwrite):
+def write_full_mt(suffix, temp_dir, overwrite, use_band_aid_table):
     mts = []
     for pop in POPS:
         mt = hl.read_matrix_table(custom_get_variant_results_path(pop, suffix, 'mt')).annotate_cols(pop=pop)
         mt = mt.annotate_cols(_logged=hl.agg.any(mt.Pvalue < 0))
         mt = mt.annotate_entries(Pvalue=hl.if_else(mt._logged, mt.Pvalue, hl.log(mt.Pvalue))).drop('_logged')
+        
+        if use_band_aid_table:
+            band_aid_ht = hl.read_table(get_case_count_bandaid_path(suffix, pop))
+            mt = mt.annotate_cols(n_cases_old = mt.n_cases, n_controls_old = mt.n_controls)
+            mt = mt.annotate_cols(n_cases = band_aid_ht[mt.col_key].n_cases, 
+                                  n_controls = band_aid_ht[mt.col_key].n_controls)
 
         mt = apply_qc(mt)
         mt = custom_patch_mt_keys(mt)
@@ -180,6 +200,10 @@ def recode_single_pheno_struct_to_legacy_path(pheno_struct):
     return f'{trait_type}-{format_pheno_dir(phenocode)}-{coding}'
 
 
+def get_case_count_bandaid_path(suffix, pop):
+    return f'{root}/sumstats/{suffix}/case_counts_hotfix/case_control_{pop}.ht'
+
+
 def main(args):
     hl.init(default_reference='GRCh37', log='/combine_results.log', branching_factor=8)
 
@@ -188,11 +212,16 @@ def main(args):
 
     if args.run_basic_load:
         for pop in pops:
+            output_path = custom_get_variant_results_path(pop, args.suffix, 'mt')
+            if args.read_previous and hl.hadoop_exists(f'{output_path}/_SUCCESS'):
+                continue
+            
             all_variant_outputs = get_all_valid_variant_results_ht_paths(pop, args.suffix)
             pheno_dict = get_pheno_dict(args.suffix)
 
-            mt = generate_sumstats_mt(all_variant_outputs, pheno_dict, f'{temp_bucket}/{args.suffix}/{pop}/variant', inner_mode)
-            mt.write(custom_get_variant_results_path(pop, args.suffix, 'mt'), overwrite=args.overwrite)
+            if len(all_variant_outputs) > 0:
+                mt = generate_sumstats_mt(all_variant_outputs, pheno_dict, f'{temp_bucket}/{args.suffix}/{pop}/variant', inner_mode)
+                mt.write(output_path, overwrite=args.overwrite)
 
     if args.run_additional_load:
         today = date.today().strftime("%y%m%d")
@@ -201,52 +230,86 @@ def main(args):
             all_variant_outputs = get_all_valid_variant_results_ht_paths(pop, args.suffix2)
             pheno_dict = get_pheno_dict(args.suffix2)
 
-            all_keys = hl.read_matrix_table(custom_get_variant_results_path(pop, args.suffix, 'mt')).col_key.collect()
-            loaded_phenos = {
-                recode_single_pheno_struct_to_legacy_path(x) for x in all_keys
-            }
-            loaded_phenos |= {f'{x.trait_type}-{format_pheno_dir(x.phenocode)}-{x.pheno_sex}-{x.coding}-{x.modifier}' for x in all_keys}
+            if len(all_variant_outputs) > 0: # only proceed if there are runs available in the new dataset
+                
+                # check if this ancestry has been processed before
+                merge_into_path = custom_get_variant_results_path(pop, args.suffix, 'mt')
+                if hl.hadoop_exists(f'{merge_into_path}/_SUCCESS'):
+                    # if it has, then follow the merging routine
+                    all_keys = hl.read_matrix_table(custom_get_variant_results_path(pop, args.suffix, 'mt')).col_key.collect()
+                    loaded_phenos = {
+                        recode_single_pheno_struct_to_legacy_path(x) for x in all_keys
+                    }
+                    loaded_phenos |= {f'{x.trait_type}-{format_pheno_dir(x.phenocode)}-{x.pheno_sex}-{x.coding}-{x.modifier}' for x in all_keys}
 
-            def _matches_any_pheno(pheno_path, phenos_to_match):
-                return any(x for x in phenos_to_match if f'/{x}/variant_results.ht' in pheno_path)
+                    def _matches_any_pheno(pheno_path, phenos_to_match):
+                        return any(x for x in phenos_to_match if f'/{x}/variant_results.ht' in pheno_path)
 
-            if args.force_reload:
-                pheno_matches = set(args.force_reload.split(','))
-                all_variant_outputs = [x for x in all_variant_outputs if _matches_any_pheno(x, pheno_matches)]
-            else:
-                all_variant_outputs = [x for x in all_variant_outputs if not _matches_any_pheno(x, loaded_phenos)]
+                    if args.force_reload:
+                        pheno_matches = set(args.force_reload.split(','))
+                        all_variant_outputs = [x for x in all_variant_outputs if _matches_any_pheno(x, pheno_matches)]
+                    else:
+                        all_variant_outputs = [x for x in all_variant_outputs if not _matches_any_pheno(x, loaded_phenos)]
 
-                if args.load_only:
-                    pheno_matches = set(args.load_only.split(','))
-                    if '' in pheno_matches:
-                        print('WARNING: Empty string in pheno_matches. Might reload more than expected')
-                    all_variant_outputs = [x for x in all_variant_outputs if _matches_any_pheno(x, pheno_matches)]
+                        if args.load_only:
+                            pheno_matches = set(args.load_only.split(','))
+                            if '' in pheno_matches:
+                                print('WARNING: Empty string in pheno_matches. Might reload more than expected')
+                            all_variant_outputs = [x for x in all_variant_outputs if _matches_any_pheno(x, pheno_matches)]
 
-            print(f'Loading {len(all_variant_outputs)} additional HTs...')
-            if len(all_variant_outputs) < 20:
-                print(all_variant_outputs)
-            if args.dry_run:
-                continue
-            if not len(all_variant_outputs):
-                continue
+                    print(f'Loading {len(all_variant_outputs)} additional HTs...')
+                    if len(all_variant_outputs) < 20:
+                        print(all_variant_outputs)
+                    if args.dry_run:
+                        continue
+                    if not len(all_variant_outputs):
+                        continue
+                    
+                    var_pos_pre = f'{temp_bucket}/{args.suffix}/{pop}/variant_{today}'
+                    mt = generate_sumstats_mt(all_variant_outputs, pheno_dict,
+                                              var_pos_pre, inner_mode, checkpoint=True)
 
-            mt = generate_sumstats_mt(all_variant_outputs, pheno_dict,
-                                      f'{temp_bucket}/{args.suffix}/{pop}/variant_{today}', inner_mode, checkpoint=True)
+                    original_mt = hl.read_matrix_table(custom_get_variant_results_path(pop, args.suffix, 'mt'))
+                    original_mt = original_mt.checkpoint(f'{temp_bucket}/{args.suffix}/{pop}/variant_before_{today}.mt', overwrite=True)
+                    if args.force_reload:
+                        original = original_mt.count_cols()
+                        original_mt = original_mt.filter_cols(
+                            hl.literal(pheno_matches).contains(hl.delimit(list(original_mt.col_key.values()), '-')), keep=False)
+                        print(f'\n\nGoing from {original} to {original_mt.count_cols()}...\n\n')
+                    mt = re_colkey_mt(mt.annotate_cols(pop=pop))
+                    original_mt = re_colkey_mt(original_mt.annotate_cols(pop=pop))
+                    mt = original_mt.union_cols(mt, row_join_type='outer')
 
-            original_mt = hl.read_matrix_table(custom_get_variant_results_path(pop, args.suffix, 'mt'))
-            original_mt = original_mt.checkpoint(f'{temp_bucket}/{args.suffix}/{pop}/variant_before_{today}.mt', overwrite=True)
-            if args.force_reload:
-                original = original_mt.count_cols()
-                original_mt = original_mt.filter_cols(
-                    hl.literal(pheno_matches).contains(hl.delimit(list(original_mt.col_key.values()), '-')), keep=False)
-                print(f'\n\nGoing from {original} to {original_mt.count_cols()}...\n\n')
-            mt = re_colkey_mt(mt.annotate_cols(pop=pop))
-            original_mt = re_colkey_mt(original_mt.annotate_cols(pop=pop))
-            mt = original_mt.union_cols(mt, row_join_type='outer')
-            mt.write(custom_get_variant_results_path(pop, args.suffix, 'mt'), overwrite=args.overwrite)
+                else:
+                    # otherwise create a new ancestry-specific MT
+                    mt = generate_sumstats_mt(all_variant_outputs, pheno_dict, f'{temp_bucket}/{args.suffix}/{pop}/variant', inner_mode)
+                
+                mt.write(custom_get_variant_results_path(pop, args.suffix, 'mt'), overwrite=args.overwrite)
 
     if args.run_combine_load:
-        write_full_mt(args.suffix, f'{temp_bucket}/{args.suffix}/full', args.overwrite)
+        write_full_mt(args.suffix, f'{temp_bucket}/{args.suffix}/full', args.overwrite, args.band_aid_case_count_table)
+
+
+    if args.produce_case_count_table:
+        for pop in pops:
+            suffix_set = [args.suffix]
+            if args.band_aid_other_suffix is not None:
+                suffix_set = suffix_set + args.band_aid_other_suffix.split(',')
+            
+            output_path = get_case_count_bandaid_path(args.suffix, pop)
+            if args.read_previous and hl.hadoop_exists(f'{output_path}/_SUCCESS'):
+                continue
+            
+            ht_list = []
+            for this_suff in suffix_set:
+                all_variant_outputs = get_all_valid_variant_results_ht_paths(pop, this_suff)
+                if len(all_variant_outputs) > 0:
+                    hts = [hl.read_table(x) for x in all_variant_outputs]
+                    ht_joined_each = merge_globals(hts, ['n_cases','n_controls'], PHENO_KEY_FIELDS)
+                    ht_list.append(ht_joined_each)
+        
+            ht_joined = hl.Table.union(*ht_list)
+            ht_joined.write(output_path, overwrite=args.overwrite)
 
 
 def re_colkey_mt(mt):
@@ -269,6 +332,10 @@ if __name__ == '__main__':
     parser.add_argument('--force_reload', help='Comma-separated list of trait_type-pheno-coding to force reload'
                                             '(e.g. continuous-50-irnt,icd_all-E10-icd10 )')
     parser.add_argument('--pops', help='comma-separated list')
+    parser.add_argument('--read-previous', action='store_true', help='for a basic or additional load, enable this to skip a pop if the table is already found.')
+    parser.add_argument('--produce-case-count-table', action='store_true', help='If true, will join the case / control counts for all phenotypes for this suffix into a table.')
+    parser.add_argument('--band-aid-other-suffix', type=str, help='Comma delimited', default=None)
+    parser.add_argument('--band-aid-case-count-table', action='store_true', help='If true, will grab the case / control count table for this suffix and add to the joined table.')
     args = parser.parse_args()
 
     main(args)

@@ -27,8 +27,10 @@ pheno_folder = f'{bucket}/phenotype'
 DESCRIPTION_PATH = f'{pheno_folder}/field_descriptions.tsv'
 
 HAIL_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/hail_utils:6.1'
-PHENO_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/rgupta_hail_utils'
-SAIGE_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/saige:1.1.5'
+#PHENO_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/rgupta_hail_utils'
+#SAIGE_DOCKER_IMAGE = 'gcr.io/ukbb-diversepops-neale/saige:1.1.5'
+PHENO_DOCKER_IMAGE = 'us-docker.pkg.dev/ukbb-diversepops-neale/pan-ukbb-docker-repo/rgupta-hail-utils'
+SAIGE_DOCKER_IMAGE = 'us-docker.pkg.dev/ukbb-diversepops-neale/pan-ukbb-docker-repo/saige:1.1.5'
 QQ_DOCKER_IMAGE = 'konradjk/saige_qq:0.2'
 
 SCRIPT_DIR = '/ukb_common/saige'
@@ -75,9 +77,10 @@ def get_covariates_with_custom(key_type, custom):
     if custom is None:
         return new_covariates
     else:
-        custom_covariates = hl.import_table(custom, impute=True)
+        custom_covariates = hl.import_table(custom, impute=True, min_partitions=160
+                             ).checkpoint(f'{temp_bucket}/temp_covars.ht', overwrite=True)
         custom_covariates = custom_covariates.annotate(s = key_type(custom_covariates.s)).key_by('s')
-        return new_covariates.annotate(**custom_covariates[new_covariates.key])
+        return new_covariates.annotate(**custom_covariates[new_covariates.key]).checkpoint(f'{temp_bucket}/temp_covars_2.ht', overwrite=True)
 
 
 def custom_get_phenos_to_run(suffix, pop, limit, specific_phenos, single_sex_only,
@@ -275,7 +278,7 @@ def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio
                      docker_image: str,
                      group_file: str = None, sparse_sigma_file: str = None, use_bgen: bool = True,
                      trait_type: str = 'continuous',
-                     chrom: str = 'chr1', min_mac: int = 1, min_maf: float = 0, max_maf: float = 0.5,
+                     chrom: str = 'chr1', min_mac: int = 1, min_maf: float = 0, max_maf: float = 0.5, cpu: int = 1,
                      memory: str = '', storage: str = '10Gi', add_suffix: str = '', log_pvalue: bool = False,
                      disable_loco: bool = False):
 
@@ -283,7 +286,7 @@ def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio
     run_saige_task: Job = p.new_job(name=f'run_saige',
                                     attributes={
                                         'analysis_type': analysis_type
-                                    }).cpu(1).storage(storage).image(docker_image)  # Step 2 is single-threaded only
+                                    }).cpu(cpu).storage(storage).image(docker_image)  # Step 2 is single-threaded only
 
     if analysis_type == 'gene':
         run_saige_task.declare_resource_group(result={f'{add_suffix}gene.txt': '{root}',
@@ -292,7 +295,7 @@ def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio
         run_saige_task.declare_resource_group(result={'single_variant.txt': '{root}'})
 
     loco_str = 'FALSE' if disable_loco else 'TRUE'
-    command = (f'set -o pipefail; {MKL_OFF} Rscript /usr/local/bin/step2_SPAtests.R '
+    command = (f'set -o pipefail; set +e; {MKL_OFF} Rscript /usr/local/bin/step2_SPAtests.R '
                f'--minMAF={min_maf} '
                f'--minMAC={min_mac} '
                f'--sampleFile={samples_file} '
@@ -300,8 +303,7 @@ def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio
                f'{"--IsOutputlogPforSingle=TRUE " if log_pvalue else ""}'
                f'--varianceRatioFile={variance_ratio_file} '
                f'--LOCO={loco_str} '
-               f'--chrom={chrom} '
-               f'--SAIGEOutputFile={run_saige_task.result} ')
+               f'--chrom={chrom} ')
 
     if use_bgen:
         command += (f'--bgenFile={vcf_file.bgen} '
@@ -316,16 +318,27 @@ def custom_run_saige(p: Batch, output_root: str, model_file: str, variance_ratio
         command += (f'--groupFile={group_file} '
                     f'--sparseSigmaFile={sparse_sigma_file} '
                     f'--is_single_in_groupTest=TRUE '
-                    f'--maxMAF_in_groupTest={max_maf} ')
+                    f'--maxMAF_in_groxupTest={max_maf} '
+                    f'--SAIGEOutputFile={run_saige_task.result} ')
                     #f'--IsOutputBETASEinBurdenTest=TRUE ')
-    command += f' 2>&1 | tee {run_saige_task.stdout}; ' # --IsOutputAFinCaseCtrl=TRUE
+    else:
+        command += f'--SAIGEOutputFile=result_file '
+    
+    command += f' 2>&1 | tee {run_saige_task.stdout}; cat {run_saige_task.stdout}; ' # --IsOutputAFinCaseCtrl=TRUE
     if analysis_type == 'gene':
         command += f"input_length=$(wc -l {group_file} | awk '{{print $1}}'); " \
             f"output_length=$(wc -l {run_saige_task.result[f'{add_suffix}gene.txt']} | awk '{{print $1}}'); " \
             f"echo 'Got input:' $input_length 'output:' $output_length | tee -a {run_saige_task.stdout}; " \
             f"if [[ $input_length > 0 ]]; then echo 'got input' | tee -a {run_saige_task.stdout}; " \
             f"if [[ $output_length == 1 ]]; then echo 'but not enough output' | tee -a {run_saige_task.stdout}; " \
-                   f"rm -f {run_saige_task.result[f'{add_suffix}gene.txt']} exit 1; fi; fi"
+                   f"rm -f {run_saige_task.result[f'{add_suffix}gene.txt']}; exit 1; fi; fi"
+    else:
+        command += f"success_found=$(cat {run_saige_task.stdout} | tail -n1 | grep '^\[1\] \"Analysis done! The results have been saved to' | wc -l | awk '{{print $1}}'); " \
+            f"dimnames_found=$(cat {run_saige_task.stdout} | tail -n40 | grep '^Error: length of .dimnames. \[2\] not equal to array extent' | wc -l | awk '{{print $1}}'); " \
+            f"if [[ $success_found -eq 1 ]]; then echo 'Success found.' | tee -a {run_saige_task.stdout}; " \
+                   f"cp result_file {run_saige_task.result}; " \
+            f"elif [[ $dimnames_found -eq 1 ]]; then echo 'Failed due to dimnames.' | tee -a {run_saige_task.stdout}; exit 1; " \
+            f"elif [[ $success_found -ne 1 ]]; then echo 'Failed due to other reason (aborted?).' | tee -a {run_saige_task.stdout}; exit 134; fi"
     run_saige_task.command(command)
     p.write_output(run_saige_task.result, output_root)
     p.write_output(run_saige_task.stdout, f'{output_root}.{analysis_type}.log')
@@ -458,7 +471,11 @@ def main(args):
         basic_covars = ['sex', 'age', 'age2', 'age_sex', 'age2_sex']
     else:
         basic_covars = []
-    covariates = ','.join(basic_covars + [f'PC{x}' for x in range(1, num_pcs + 1)])
+    if args.include_addl_covariates is not None:
+        addl_covars = [x for x in hl.import_table(args.include_addl_covariates).row if x not in ['s']]
+    else:
+        addl_covars = []
+    covariates = ','.join(basic_covars + addl_covars + [f'PC{x}' for x in range(1, num_pcs + 1)])
     n_threads = 8
     analysis_type = "variant"
     chromosomes = list(map(str, range(1, 23))) + ['X']
@@ -537,7 +554,7 @@ def main(args):
                 fit_null_task = custom_fit_null_glmm(p, null_glmm_root, pheno_exports[stringify_pheno_key_dict(pheno_key_dict)],
                                                      pheno_key_dict['trait_type'], covariates,
                                                      get_ukb_grm_plink_path(pop, iteration, window), SAIGE_DOCKER_IMAGE,
-                                                     inv_normalize=False, n_threads=n_threads, min_covariate_count=1,
+                                                     inv_normalize=args.force_inv_normalize, n_threads=n_threads, min_covariate_count=1,
                                                      non_pre_emptible=args.non_pre_emptible, storage='100Gi', disable_loco=args.disable_loco)
                 fit_null_task.attributes.update({'pop': pop})
                 fit_null_task.attributes.update(copy.deepcopy(pheno_key_dict))
@@ -616,7 +633,8 @@ def main(args):
                         samples_file = p.read_input(get_ukb_samples_file_path(pop, iteration))
                         saige_task = custom_run_saige(p, results_path, model_file, variance_ratio_file, vcf_file, samples_file,
                                                       SAIGE_DOCKER_IMAGE, trait_type=pheno_key_dict['trait_type'], use_bgen=use_bgen,
-                                                      chrom=chromosome, log_pvalue=args.log_p, disable_loco=args.disable_loco)
+                                                      chrom=chromosome, log_pvalue=args.log_p, disable_loco=args.disable_loco,
+                                                      cpu=args.n_cpu_saige)
                         saige_task.attributes.update({'interval': interval, 'pop': pop})
                         saige_task.attributes.update(copy.deepcopy(pheno_key_dict))
                         saige_tasks.append(saige_task)
@@ -639,7 +657,7 @@ def main(args):
 
                 load_task = custom_load_results_into_hail(p, pheno_results_dir, pheno_key_dict,
                                                           saige_tasks, get_ukb_vep_path(), PHENO_DOCKER_IMAGE,
-                                                          saige_log=saige_log, analysis_type=analysis_type,
+                                                          analysis_type=analysis_type, saige_log=null_glmm_root,#saige_log, 
                                                           n_threads=args.n_cpu_merge, null_glmm_log=null_glmm_root,
                                                           reference=reference, legacy_annotations=True, log_pvalue=args.log_p)
                 load_task.attributes['pop'] = pop
@@ -688,7 +706,9 @@ if __name__ == '__main__':
     parser.add_argument('--append', action='store_true', help='If enabled, will attempt to augment the pheno MT with new phenotypes.')
     parser.add_argument('--disable_loco', action='store_true', help='If enabled, will avoid LOCO. This was the original pan-ancestry pipeline behavior.')
     parser.add_argument('--log_p', action='store_true', help='Log transform p-values via SAIGE.')
+    parser.add_argument('--n_cpu_saige', type=int, default=1, help='Number of threads to request for running SAIGE.')
     parser.add_argument('--n_cpu_merge', type=int, default=8, help='Number of threads to request during summary stat merging.')
+    parser.add_argument('--force_inv_normalize', action='store_true')
     args = parser.parse_args()
 
     main(args)
