@@ -77,10 +77,9 @@ def get_covariates_with_custom(key_type, custom):
     if custom is None:
         return new_covariates
     else:
-        custom_covariates = hl.import_table(custom, impute=True, min_partitions=40
-                             ).checkpoint(f'{temp_bucket}/temp_covars.ht', overwrite=True)
-        custom_covariates = custom_covariates.annotate(s = key_type(custom_covariates.s)).key_by('s')
-        return new_covariates.annotate(**custom_covariates[new_covariates.key]).checkpoint(f'{temp_bucket}/temp_covars_2.ht', overwrite=True)
+        custom_covariates = hl.import_table(custom, impute=True)
+        custom_covariates = custom_covariates.key_by(s = key_type(custom_covariates.s))
+        return new_covariates.annotate(**custom_covariates[new_covariates.key])#.checkpoint(f'{temp_bucket}/temp_covars_2.ht', overwrite=True)
 
 
 def custom_get_phenos_to_run(suffix, pop, limit, specific_phenos, single_sex_only,
@@ -184,6 +183,32 @@ def produce_custom_phenotype_mt(data_path, extn, suffix, trait_type, modifier, s
     else:
         mt.write(mt_path, overwrite=overwrite)
     custom_summarize_data(suffix, overwrite=overwrite)
+
+
+def export_pheno_serial_custom(output_path, pheno_keys, proportion_single_sex, suffix, pop, include_addl_covariates, pheno_sex='both_sexes'):
+    binary_trait = saige_pheno_types.get(pheno_keys['trait_type']) != 'quantitative'
+    mt = get_custom_ukb_pheno_mt(suffix, pop, include_addl_covariates)
+    mt = mt.filter_cols(hl.all(lambda x: x, [mt[k] == pheno_keys[k] for k in PHENO_KEY_FIELDS if k != 'pheno_sex']))
+    pheno_sex_mt = mt.filter_cols(mt.pheno_sex == pheno_sex)
+    if pheno_sex_mt.count_cols() == 1:
+        mt = pheno_sex_mt
+    else:
+        mt = mt.filter_cols(mt.pheno_sex == 'both_sexes')
+    mt = mt.select_entries(value=mt[pheno_sex])
+    if binary_trait:
+        mt = mt.select_entries(value=hl.int(mt.value))
+    if proportion_single_sex > 0:
+        prop_female = mt.n_cases_females / (mt.n_cases_males + mt.n_cases_females)
+        prop_female = prop_female.collect()[0]
+        print(f'Female proportion: {prop_female}')
+        if prop_female <= proportion_single_sex:
+            print(f'{prop_female} less than {proportion_single_sex}. Filtering to males...')
+            mt = mt.filter_rows(mt.sex == 1)
+        elif prop_female >= 1 - proportion_single_sex:
+            print(f'{prop_female} greater than {1 - proportion_single_sex}. Filtering to females...')
+            mt = mt.filter_rows(mt.sex == 0)
+    ht = mt.key_cols_by().select_cols().entries()
+    ht.export(output_path)
 
 
 def export_pheno_custom(p: Batch, output_path: str, pheno_keys, module: str, mt_loading_function: str,
@@ -496,11 +521,13 @@ def main(args):
                                     append=args.append, overwrite=args.overwrite_pheno_data,
                                     custom_covars=args.include_addl_covariates)
 
-    backend = hb.ServiceBackend(billing_project='ukb_diverse_pops',
-                                bucket=temp_bucket.split('gs://', 1)[-1])
+    if not args.force_serial_phenotype_export:
+        backend = hb.ServiceBackend(billing_project='ukb_diverse_pops',
+                                    bucket=temp_bucket.split('gs://', 1)[-1])
     for pop in pops:
-        p = hb.Batch(name=f'saige_pan_ancestry_{pop}', backend=backend, default_image=SAIGE_DOCKER_IMAGE,
-                     default_storage='500Mi', default_cpu=n_threads)
+        if not args.force_serial_phenotype_export:
+            p = hb.Batch(name=f'saige_pan_ancestry_{pop}', backend=backend, default_image=SAIGE_DOCKER_IMAGE,
+                        default_storage='500Mi', default_cpu=n_threads)
         window = '1e7' if pop == 'EUR' else '1e6'
         logger.info(f'Setting up {pop}...')
         chunk_size = int(5e6) if pop != 'EUR' else int(1e6)
@@ -520,19 +547,26 @@ def main(args):
 
         for pheno_key_dict in phenos_to_run:
             pheno_export_path = get_pheno_output_path(pheno_export_dir, pheno_key_dict, legacy=False)
-            if not args.overwrite_pheno_data and pheno_export_path in phenos_already_exported:
+            if args.force_serial_phenotype_export:
+                export_pheno_serial_custom(pheno_export_path, pheno_key_dict, proportion_single_sex=0, 
+                                           suffix=args.suffix, pop=pop, include_addl_covariates=args.include_addl_covariates)
+                pheno_file = ''
+            elif not args.overwrite_pheno_data and pheno_export_path in phenos_already_exported:
                 pheno_file = p.read_input(pheno_export_path)
             else:
                 # NOTE need to update module and function name
                 addlargs = f'{args.suffix},{pop}' if args.include_addl_covariates is None else f'{args.suffix},{pop},{args.include_addl_covariates}'
                 pheno_task = export_pheno_custom(p, pheno_export_path, pheno_key_dict, 'ukbb_pan_ancestry.saige_pan_ancestry_custom', 'get_custom_ukb_pheno_mt', 
-                                                 PHENO_DOCKER_IMAGE, additional_args=addlargs, n_threads=n_threads, proportion_single_sex=0)
+                                                 PHENO_DOCKER_IMAGE, additional_args=addlargs, n_threads=args.n_cpu_pheno, proportion_single_sex=0)
                 pheno_task.attributes.update({'pop': pop})
                 pheno_file = pheno_task.out
             pheno_exports[stringify_pheno_key_dict(pheno_key_dict)] = pheno_file
         completed = Counter([isinstance(x, hb.resource.InputResourceFile) for x in pheno_exports.values()])
         logger.info(f'Exporting {completed[False]} phenos (already found {completed[True]})...')
-
+        
+        if args.force_serial_phenotype_export:
+            break
+        
         overwrite_null_models = args.create_null_models
         null_model_dir = f'{root}/null_glmm/{args.suffix}/{pop}'
         null_models_already_created = {}
@@ -708,8 +742,10 @@ if __name__ == '__main__':
     parser.add_argument('--log_p', action='store_true', help='Log transform p-values via SAIGE.')
     parser.add_argument('--n_cpu_saige', type=int, default=1, help='Number of threads to request for running SAIGE.')
     parser.add_argument('--n_cpu_merge', type=int, default=8, help='Number of threads to request during summary stat merging.')
+    parser.add_argument('--n_cpu_pheno', default=16, type=int)
     parser.add_argument('--n_threads', default=8, type=int)
     parser.add_argument('--force_inv_normalize', action='store_true')
+    parser.add_argument('--force_serial_phenotype_export', action='store_true')
     args = parser.parse_args()
 
     main(args)
