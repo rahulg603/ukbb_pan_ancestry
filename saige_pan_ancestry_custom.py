@@ -23,6 +23,7 @@ root_vcf = f'{bucket_vcf}/results'
 bucket = 'gs://rgupta-assoc'
 root = f'{bucket}/saige_gwas'
 pheno_folder = f'{bucket}/phenotype'
+temp_bucket = 'gs://ukbb-diverse-temp-30day-multiregion'
 
 DESCRIPTION_PATH = f'{pheno_folder}/field_descriptions.tsv'
 
@@ -527,7 +528,7 @@ def main(args):
     for pop in pops:
         if not args.force_serial_phenotype_export:
             p = hb.Batch(name=f'saige_pan_ancestry_{pop}', backend=backend, default_image=SAIGE_DOCKER_IMAGE,
-                        default_storage='500Mi', default_cpu=n_threads)
+                         default_storage='500Mi', default_cpu=n_threads)
         window = '1e7' if pop == 'EUR' else '1e6'
         logger.info(f'Setting up {pop}...')
         chunk_size = int(5e6) if pop != 'EUR' else int(1e6)
@@ -668,7 +669,7 @@ def main(args):
                         saige_task = custom_run_saige(p, results_path, model_file, variance_ratio_file, vcf_file, samples_file,
                                                       SAIGE_DOCKER_IMAGE, trait_type=pheno_key_dict['trait_type'], use_bgen=use_bgen,
                                                       chrom=chromosome, log_pvalue=args.log_p, disable_loco=args.disable_loco,
-                                                      cpu=args.n_cpu_saige)
+                                                      cpu=args.n_cpu_saige, min_mac=args.min_mac)
                         saige_task.attributes.update({'interval': interval, 'pop': pop})
                         saige_task.attributes.update(copy.deepcopy(pheno_key_dict))
                         saige_tasks.append(saige_task)
@@ -744,6 +745,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_cpu_merge', type=int, default=8, help='Number of threads to request during summary stat merging.')
     parser.add_argument('--n_cpu_pheno', default=16, type=int)
     parser.add_argument('--n_threads', default=8, type=int)
+    parser.add_argument('--min_mac', default=1, type=int)
     parser.add_argument('--force_inv_normalize', action='store_true')
     parser.add_argument('--force_serial_phenotype_export', action='store_true')
     args = parser.parse_args()

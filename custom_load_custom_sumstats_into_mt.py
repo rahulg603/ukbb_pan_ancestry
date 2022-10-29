@@ -2,7 +2,6 @@
 
 __author__ = 'rahulg modifying konradk'
 
-import sys
 import argparse
 from pprint import pprint
 from datetime import date
@@ -10,6 +9,7 @@ from collections import Counter
 from tqdm import tqdm
 from ukbb_pan_ancestry import *
 from ukbb_pan_ancestry.load_all_results import apply_qc
+from ukbb_pan_ancestry.resources.results import get_variant_results_qc_path
 from ukbb_pan_ancestry.saige_pan_ancestry_custom import *
 
 
@@ -55,20 +55,6 @@ def custom_unify_saige_ht_schema(ht, patch_case_control_count: str = ''):
     
     ht = ht.annotate(BETA = hl.float64(ht.BETA), SE = hl.float64(ht.SE))
 
-    # ht2 = ht.head(1)
-    # pheno_key_dict = dict(ht2.aggregate(hl.agg.take(ht2.key, 1)[0]))
-    # if patch_case_control_count:
-    #     if not ht.n_cases.collect()[0]:
-    #         directory, tpc, _ = patch_case_control_count.rsplit('/', 2)
-
-    #         pheno_results_dir = get_pheno_output_path(directory, pheno_key_dict, '', legacy=False)
-    #         prefix = get_results_prefix(pheno_results_dir, pheno_key_dict, '{chrom}', 1, legacy=False)
-    #         saige_log = f'{prefix}.variant.log'
-    #         cases, controls = custom_get_cases_and_controls_from_log(saige_log)
-    #         print(f'Patched pheno: {tpc}. Got {cases} cases and {controls} controls.')
-    #         if cases == -1: cases = hl.null(hl.tint)
-    #         if controls == -1: controls = hl.null(hl.tint)
-    #         ht = ht.annotate_globals(n_cases=cases, n_controls=controls)
     if 'heritability' not in list(ht.globals):
         ht = ht.annotate_globals(heritability=hl.null(hl.tfloat64))
     if 'saige_version' not in list(ht.globals):
@@ -137,7 +123,28 @@ def generate_sumstats_mt(all_variant_outputs, pheno_dict, temp_dir, inner_mode =
     return mt
 
 
-def write_full_mt(suffix, temp_dir, overwrite, use_band_aid_table):
+def custom_get_analysis_data_path(suffix, subdir: str, dataset: str, pop: str, extension: str = 'txt.bgz'):
+    return f'{root}/sumstats_qc_analysis/{suffix}/{subdir}/{dataset}_{pop}.{extension}'
+
+
+def custom_generate_final_lambdas(mt, suffix, overwrite):
+    qual_ht = hl.read_table(get_variant_results_qc_path())
+    mt = mt.annotate_rows(**qual_ht[mt.row_key])
+    mt = mt.annotate_cols(
+        pheno_data=hl.zip(mt.pheno_data, hl.agg.array_agg(
+            lambda ss: hl.agg.filter(~ss.low_confidence & mt.high_quality,
+                hl.struct(lambda_gc=hl.methods.statgen._lambda_gc_agg(hl.exp(ss.Pvalue)),
+                          n_variants=hl.agg.count_where(hl.is_defined(ss.Pvalue)),
+                          n_sig_variants=hl.agg.count_where(hl.exp(ss.Pvalue) < 5e-8))),
+            mt.summary_stats)).map(lambda x: x[0].annotate(**x[1]))
+    )
+    ht = mt.cols()
+    ht = ht.checkpoint(custom_get_analysis_data_path(suffix, 'lambda', 'lambdas', 'full', 'ht'), overwrite=overwrite, _read_if_exists=not overwrite)
+    ht.explode('pheno_data').flatten().export(custom_get_analysis_data_path(suffix, 'lambda', 'lambdas', 'full', 'txt.bgz'))
+    return mt
+
+
+def custom_write_full_mt(suffix, temp_dir, overwrite, use_band_aid_table, skip_producing_lambdas):
     mts = []
     for pop in POPS:
         mt = hl.read_matrix_table(custom_get_variant_results_path(pop, suffix, 'mt')).annotate_cols(pop=pop)
@@ -170,10 +177,14 @@ def write_full_mt(suffix, temp_dir, overwrite, use_band_aid_table):
         **{f'n_cases_full_cohort_{sex}': full_mt.pheno_data[f'n_cases_{sex}'][0]
            for sex in ('both_sexes', 'females', 'males')}
     )
-    full_mt.write(custom_get_variant_results_path('full', suffix), overwrite)
+    if not skip_producing_lambdas:
+        full_mt = full_mt.checkpoint(f'{temp_dir}/staging_lambdas.mt', overwrite=True)
+        full_mt = custom_generate_final_lambdas(full_mt, suffix, overwrite)
+    
+    full_mt = full_mt.checkpoint(custom_get_variant_results_path('full', suffix), overwrite)
     print('Pops per pheno:')
     pprint(dict(Counter(full_mt.aggregate_cols(hl.agg.counter(hl.len(full_mt.pheno_data))))))
-
+    
 
 def reannotate_cols(mt, suffix):
     pheno_dict = get_pheno_dict(suffix)
@@ -287,7 +298,7 @@ def main(args):
                 mt.write(custom_get_variant_results_path(pop, args.suffix, 'mt'), overwrite=args.overwrite)
 
     if args.run_combine_load:
-        write_full_mt(args.suffix, f'{temp_bucket}/{args.suffix}/full', args.overwrite, args.band_aid_case_count_table)
+        custom_write_full_mt(args.suffix, f'{temp_bucket}/{args.suffix}/full', args.overwrite, args.band_aid_case_count_table, args.skip_producing_lambdas)
 
 
     if args.produce_case_count_table:
@@ -336,6 +347,7 @@ if __name__ == '__main__':
     parser.add_argument('--produce-case-count-table', action='store_true', help='If true, will join the case / control counts for all phenotypes for this suffix into a table.')
     parser.add_argument('--band-aid-other-suffix', type=str, help='Comma delimited', default=None)
     parser.add_argument('--band-aid-case-count-table', action='store_true', help='If true, will grab the case / control count table for this suffix and add to the joined table.')
+    parser.add_argument('--skip-producing-lambdas', action='store_true', help='only applies to --run_combine_load')
     args = parser.parse_args()
 
     main(args)
