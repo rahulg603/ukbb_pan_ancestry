@@ -33,6 +33,10 @@ def custom_get_variant_results_path(pop: str, suffix: str, extension: str = 'mt'
     return f'{root}/sumstats/{suffix}/mt/results_{pop}.{extension}'
 
 
+def custom_get_meta_results_path(suffix: str, extension: str = 'mt'):
+    return f'{root}/sumstats/{suffix}/mt/meta_analysis.{extension}'
+
+
 def custom_unify_saige_ht_schema(ht, patch_case_control_count: str = ''):
     """
 
@@ -42,16 +46,21 @@ def custom_unify_saige_ht_schema(ht, patch_case_control_count: str = ''):
     :rtype: Table
     """
     #assert ht.head(1).annotation.collect()[0] is None, f'failed at {patch_case_control_count}'
-    if 'AF.Cases' not in list(ht.row):
+    if 'AF_case' not in list(ht.row):
         ht = ht.select('AC_Allele2', 'AF_Allele2', 'MissingRate', 'N', 'BETA', 'SE',
                        **{'p.value.NA': hl.null(hl.tfloat64), 'Is.SPA.converge': hl.null(hl.tint32),
                           'var': ht.var, 'AF.Cases': hl.null(hl.tfloat64),
                           'AF.Controls': hl.null(hl.tfloat64), 'Pvalue': ht.Pvalue,
                           'gene': hl.or_else(ht.gene, ''), 'annotation': hl.or_else(ht.annotation, '')})
     else:
-        ht = ht.select('AC_Allele2', 'AF_Allele2', 'MissingRate', 'N', 'BETA', 'SE',
-                       'p.value.NA', 'Is.SPA.converge', 'var', 'AF.Cases',
-                       'AF.Controls', 'Pvalue', gene=hl.or_else(ht.gene, ''), annotation=hl.or_else(ht.annotation, ''))
+        ht = ht.rename({'Is.SPA': 'Is.SPA.converge', 'AF_case':'AF.Cases', 'AF_ctrl':'AF.Controls'})
+        ht = ht.annotate_globals(n_cases = ht.head(1).N_case.collect()[0], 
+                                 n_controls = ht.head(1).N_ctrl.collect()[0])
+        ht = ht.select('AC_Allele2', 'AF_Allele2', 'MissingRate', 
+                       **{'N': ht.N_case + ht.N_ctrl, 'BETA':ht.BETA, 'SE':ht.SE,
+                          'p.value.NA':ht['p.value.NA'], 'Is.SPA.converge':hl.null(hl.tint32),#'Is.SPA.converge':ht['Is.SPA.converge'], 
+                          'var':ht.var, 'AF.Cases':ht['AF.Cases'], 'AF.Controls':ht['AF.Controls'], 
+                          'Pvalue':ht.Pvalue, 'gene': hl.or_else(ht.gene, ''), 'annotation':hl.or_else(ht.annotation, '')})
     
     ht = ht.annotate(BETA = hl.float64(ht.BETA), SE = hl.float64(ht.SE))
 
@@ -144,9 +153,9 @@ def custom_generate_final_lambdas(mt, suffix, overwrite):
     return mt
 
 
-def custom_write_full_mt(suffix, temp_dir, overwrite, use_band_aid_table, skip_producing_lambdas):
+def custom_write_full_mt(suffix, temp_dir, overwrite, use_band_aid_table, skip_producing_lambdas, pops):
     mts = []
-    for pop in POPS:
+    for pop in pops:
         mt = hl.read_matrix_table(custom_get_variant_results_path(pop, suffix, 'mt')).annotate_cols(pop=pop)
         mt = mt.annotate_cols(_logged=hl.agg.any(mt.Pvalue < 0))
         mt = mt.annotate_entries(Pvalue=hl.if_else(mt._logged, mt.Pvalue, hl.log(mt.Pvalue))).drop('_logged')
@@ -298,7 +307,7 @@ def main(args):
                 mt.write(custom_get_variant_results_path(pop, args.suffix, 'mt'), overwrite=args.overwrite)
 
     if args.run_combine_load:
-        custom_write_full_mt(args.suffix, f'{temp_bucket}/{args.suffix}/full', args.overwrite, args.band_aid_case_count_table, args.skip_producing_lambdas)
+        custom_write_full_mt(args.suffix, f'{temp_bucket}/{args.suffix}/full', args.overwrite, args.band_aid_case_count_table, args.skip_producing_lambdas, pops=pops)
 
 
     if args.produce_case_count_table:
