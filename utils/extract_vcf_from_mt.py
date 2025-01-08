@@ -66,9 +66,10 @@ def main(args):
 
     if not args.input_bgen or args.encoding == 'recessive':
         mt = mt.select_entries('GT')
-        mt = mt.filter_rows(hl.agg.count_where(mt.GT.is_non_ref()) > 0)
     else:
         mt = mt.select_entries('GP')
+    if not args.input_bgen:
+        mt = mt.filter_rows(hl.agg.count_where(mt.GT.is_non_ref()) > 0)
     mt = mt.annotate_rows(rsid=mt.locus.contig + ':' + hl.str(mt.locus.position) + '_' + mt.alleles[0] + '/' + mt.alleles[1])
 
     if args.callrate_filter:
@@ -81,7 +82,18 @@ def main(args):
                 mt = mt.annotate_entries(GT = hl.if_else(mt.GT.is_het(), hl.call(0, 0, phased=False), mt.GT))
             mt = gt_to_gp(mt)
             mt = impute_missing_gp(mt, mean_impute=args.mean_impute_missing)
-        hl.export_bgen(mt, args.output_file, gp=mt.GP, varid=mt.rsid)
+        
+        if mt.count_rows() == 0:
+            with open(args.output_file + '.bgen', 'w') as f:
+                f.write('Failed due to no variants.')
+            with open(args.output_file + '.sample', 'w') as f:
+                f.write('Failed due to no variants.')
+            with open(args.output_file + '.bgen.bgi', 'w') as f:
+                f.write('Failed due to no variants.')
+            with open(args.output_file + '.failure', 'w') as f:
+                f.write('Failed due to no variants.')
+        else:
+            hl.export_bgen(mt, args.output_file, gp=mt.GP, varid=mt.rsid)
     else:
         mt = mt.annotate_entries(GT=hl.or_else(mt.GT, hl.call(0, 0)))
         # Note: no mean-imputation for VCF
